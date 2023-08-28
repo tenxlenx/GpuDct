@@ -8,6 +8,7 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(${PROJECT_NAME} STATIC src/gpu_dct.cu
         include/gpu_dct.cuh)
+
 include_directories(
         ${OpenCV_INCLUDE_DIRS}
         ${CUDAToolkit_INCLUDE_DIRS}
