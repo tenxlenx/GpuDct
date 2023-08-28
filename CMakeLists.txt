@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.26)
-project(GpuDctLib CUDA CXX)
+project(GpuDct CUDA CXX)
 set(CMAKE_CUDA_ARCHITECTURES 89)
 set(CMAKE_CUDA_STANDARD 17)
 
 find_package(OpenCV CONFIG REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
-add_library(GpuDctLib STATIC src/gpu_dct.cu
+add_library(${PROJECT_NAME} STATIC src/gpu_dct.cu
         include/gpu_dct.cuh)
 include_directories(
         ${OpenCV_INCLUDE_DIRS}
@@ -27,11 +27,11 @@ target_link_libraries(${PROJECT_NAME}
 
 
 # Set include directories for your library
-target_include_directories(GpuDctLib PUBLIC
+target_include_directories(${PROJECT_NAME} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 # Set output directory for the library file
-set_target_properties(GpuDctLib PROPERTIES
+set_target_properties(${PROJECT_NAME} PROPERTIES
         ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib
 )
 
