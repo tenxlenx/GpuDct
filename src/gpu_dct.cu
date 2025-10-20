@@ -1,360 +1,657 @@
 #include "../include/gpu_dct.cuh"
+#include "gpu_dct_impl.cuh"
 
-#include "device_launch_parameters.h"
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <ranges>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <mutex>
+#include <vector>
 
-#include "cublas_v2.h"
-#include "cuda_runtime.h"
-#include "cuda.h"
+namespace gpu_dct {
 
-/**
- * @brief adds ap all the bit values in a warp
- *
- * @param s_data shared memory containing the values we need to add up to get the final value
- * @param tid thread id
- *
- */
-__device__ void warp_add_bits(volatile unsigned long long int* s_data, int tid)
+namespace {
+
+template<typename ComputeType>
+void fill_dct_transform(ComputeType* out, int n)
 {
-    if (tid < 32) {
-        s_data[tid] += s_data[tid + 32];
-        s_data[tid] += s_data[tid + 16];
-        s_data[tid] += s_data[tid + 8];
-        s_data[tid] += s_data[tid + 4];
-        s_data[tid] += s_data[tid + 2];
-        s_data[tid] += s_data[tid + 1];
-    }
-}
-
-/**
- * @brief this function adds up the bits in a bit array to create an unsigned long long integer
- * number of blocks should be the number of elements to make hash values
- * and the number of threads should be 64 - to be consistent with std::bitset implementation
- * this version does not reverse the bit sequence
- *
- * @param bit_array array of int values containing 64 x num elements
- * @param binary array of unsigned long long int values x num elements
- *
- */
-__global__ void kernel_add_bits(const int* bit_array, unsigned long long int* binary)
-{
-    int uid = blockIdx.x * blockDim.x + threadIdx.x;
-    int bid = blockIdx.x;
-    int tid = threadIdx.x;
-
-    __shared__ unsigned long long int reversed_bit_values[64];
-    __shared__ unsigned long long int bit_values[64];
-    __shared__ int s_bit_array[64];
-    __shared__ int reversed_bit_array[64];
-
-    // load bit values to shared memory
-    s_bit_array[tid] = bit_array[uid];
-    __syncthreads();
-
-    double x = __int2double_rn(s_bit_array[tid]);
-    bit_values[tid] = __double2ull_rn(scalbn(x, tid));
-    __syncthreads();
-
-    // add up all the numbers to make the bit values
-    warp_add_bits(bit_values, tid);
-    __syncthreads();
-
-    // store result
-    binary[bid] = bit_values[0];
-    __syncthreads();
-}
-
-__global__ void kernel_get_T(float* T)
-{
-    int uid = blockIdx.x * blockDim.x + threadIdx.x;
-    int bid = blockIdx.x;
-    int tid = threadIdx.x;
-
-    float j = (float)tid;
-    float i = (float)bid;
-    float N = (float)blockDim.x;
-    const float PI = 3.141592654;
-    // different normalisation for first column
-
-    if (bid == 0) {
-        T[uid] = sqrt(1.0 / N) * cos(((2 * j + 1)) / (2.0 * N) * PI * i);
-    }
-    else {
-        T[uid] = sqrt(2.0 / N) * cos(((2 * j + 1)) / (2.0 * N) * PI * i);
-    }
-}
-
-//! threads per block = 64 x n_images, blocks = n_images
-__global__ void kernel_compute_hash(float* dct_imgs, int* bit_array, int cols)
-{
-    int bid = blockIdx.x;
-    int tid = threadIdx.x;
-
-    int roi_offset = tid % 8 + ((tid / 8) * cols);
-    __shared__ float s_array[64];
-    __shared__ float sb_array[64];
-    s_array[threadIdx.x] = dct_imgs[roi_offset + bid * blockIdx.x];
-    sb_array[threadIdx.x] = dct_imgs[roi_offset + bid * blockIdx.x];
-    __syncthreads();
-
-    // sort arrays
-    for (int i = 0; i < cols / 2; i++) {
-        int j = tid;
-        if (j % 2 == 0 && j < cols - 1) {
-            if (s_array[j + 1] < s_array[j]) {
-                float temp = s_array[j];
-                s_array[j] = s_array[j + 1];
-                s_array[j + 1] = temp;
-            }
+    const ComputeType pi = static_cast<ComputeType>(3.14159265358979323846);
+    for (int i = 0; i < n; ++i) {
+        const ComputeType scale = (i == 0)
+                                      ? std::sqrt(static_cast<ComputeType>(1) / n)
+                                      : std::sqrt(static_cast<ComputeType>(2) / n);
+        for (int j = 0; j < n; ++j) {
+            out[static_cast<size_t>(i) * n + j] =
+                scale * std::cos(pi * i * (2 * j + 1) / (2 * n));
         }
-        __syncthreads();
-        if (j % 2 == 1 && j < cols - 1) {
-            if (s_array[j + 1] < s_array[j]) {
-                float temp = s_array[j];
-                s_array[j] = s_array[j + 1];
-                s_array[j + 1] = temp;
-            }
+    }
+}
+
+template<typename ComputeType, int N>
+std::array<ComputeType, static_cast<size_t>(N) * N> make_dct_transform_array()
+{
+    std::array<ComputeType, static_cast<size_t>(N) * N> result{};
+    fill_dct_transform(result.data(), N);
+    return result;
+}
+
+template<typename ComputeType>
+std::vector<ComputeType> make_dct_transform_vector(int n)
+{
+    std::vector<ComputeType> result(static_cast<size_t>(n) * static_cast<size_t>(n));
+    fill_dct_transform(result.data(), n);
+    return result;
+}
+
+} // namespace
+
+// ============================================================================
+// Template Class Implementation
+// ============================================================================
+
+void throw_on_cuda_error(cudaError_t error, std::string_view context)
+{
+    if (error != cudaSuccess) {
+        throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(error));
+    }
+}
+
+template<typename T>
+    requires DctScalar<T>
+GpuDct<T>::GpuDct(int n, cudaStream_t stream)
+    : m_size(n)
+    , m_stream(stream)
+    , m_owns_stream(stream == nullptr)
+    , m_pool(nullptr)
+{
+    static constexpr std::array<int, 4> kSupportedSizes{32, 64, 128, 256};
+    if (std::ranges::find(kSupportedSizes, n) == kSupportedSizes.end()) {
+        throw std::runtime_error("GpuDct only supports sizes: 32, 64, 128, 256");
+    }
+
+    // Create stream if not provided
+    if (m_owns_stream) {
+        throw_on_cuda_error(cudaStreamCreate(&m_stream), "Failed to create CUDA stream");
+    }
+
+    // Create memory pool
+    try {
+        m_pool = std::make_unique<StreamMemoryPool>();
+    } catch (...) {
+        if (m_owns_stream) {
+            cudaStreamDestroy(m_stream);
         }
-        __syncthreads();
+        throw;
     }
-    __syncthreads();
 
-    const float median = (s_array[31] + s_array[32]) / 2;
-    if (sb_array[tid] > median) {
-        bit_array[tid] = 1;
+    // Initialize transform matrix (ensures transform ready before first kernel)
+    try {
+        init_transform_matrix();
+    } catch (...) {
+        if (m_transform_device) {
+            cudaFreeAsync(m_transform_device, m_stream);
+            m_transform_device = nullptr;
+        }
+        m_transform_ptr = nullptr;
+        m_transform_elements = 0;
+        m_pool.reset();
+        if (m_owns_stream && m_stream) {
+            cudaStreamDestroy(m_stream);
+            m_stream = nullptr;
+        }
+        throw;
     }
-    else {
-        bit_array[tid] = 0;
-    }
-    __syncthreads();
 }
 
-void GpuDct::setHandle(const cublasHandle_t& _handle)
-{
-    m_handle = _handle;
-}
-
-GpuDct::GpuDct(int n)
-{
-    m_size = n;
-    cudaMalloc(&d_T, n * n * sizeof(float));
-    getDCTMatrix(n, n, d_T);
-    cublasCreate(&m_handle);
-    cudaMalloc(&d_A, n * n * sizeof(float));
-    cudaMalloc(&d_bits, 64 * sizeof(int));
-    cudaMalloc(&d_tmp, n * n * sizeof(float));
-    cudaMalloc(&d_DCT, n * n * sizeof(float));
-}
-
-GpuDct::~GpuDct()
-{
-    cublasDestroy(m_handle);
-    cudaFree(d_T);
-    cudaFree(d_bits);
-    cudaFree(d_tmp);
-    cudaFree(d_A);
-    cudaFree(d_DCT);
-}
-
-/**
- * @brief calculate the dct hash value of a single image and return the hash value
- *
- * @param img image
- * @return hash value
- */
-unsigned long long int GpuDct::dct(const cv::Mat& img)
-{
-    unsigned long long int* d_hash_val;
-    cudaMalloc(&d_hash_val, sizeof(unsigned long long int));
-
-    cudaMemset(d_A, 0, m_size * m_size * sizeof(float));
-    cudaMemcpy(d_A, reinterpret_cast<float*>(img.data), m_size * m_size * sizeof(float), cudaMemcpyHostToDevice);
-    unsigned long long int hash = gpu_dct_single(d_A, d_hash_val);
-    cudaFree(d_hash_val);
-    return hash;
-}
-
-/**
- * @brief calculates dct hash
- *
- * @param d_img GPU image
- * @param d_hash GPU hash value hash gets copied to user supplied hash value - need to allocate memory on calling side
- *
- */
-void GpuDct::dct(const float* d_img, unsigned long long int* d_hash_val)
-{
-    unsigned long long int* d_hash;
-    cudaMalloc(&d_hash, sizeof(unsigned long long int));
-    gpu_dct_single(d_img, d_hash);
-    cudaMemcpy(d_hash_val, d_hash, sizeof(unsigned long long int), cudaMemcpyDeviceToDevice);
-    cudaFree(d_hash);
-}
-
-/// <summary>
-/// Performs a discrete cosine transform on the given image and stores the result in the given hash value.
-/// </summary>
-/// <param name="img">The image to perform the DCT on.</param>
-/// <param name="d_hash_val">The hash value to store the result in.</param>
-/// <returns>
-/// Nothing.
-/// </returns>
-void GpuDct::dct(const cv::Mat& img, unsigned long long int* d_hash_val)
-{
-    unsigned long long int* d_hash;
-    cudaMalloc(&d_hash, sizeof(unsigned long long int));
-    cudaMemset(d_A, 0, m_size * m_size * sizeof(float));
-    cudaMemcpy(d_A, reinterpret_cast<float*>(img.data), m_size * m_size * sizeof(float), cudaMemcpyHostToDevice);
-    gpu_dct_single(d_A, d_hash);
-    cudaMemcpy(d_hash_val, d_hash, sizeof(unsigned long long int), cudaMemcpyDeviceToDevice);
-    cudaFree(d_hash);
-}
-
-/// <summary>
-/// Calculates the DCT hash values of a vector of cv::Mat images using GPU.
-/// </summary>
-/// <param name="images">The images to be hashed.</param>
-/// <param name="d_hash_values">The hash values of the images [gpu].</param>
-/// <returns>
-/// void
-/// </returns>
-/**
- * @brief calculate the DCT hash values of a vector of cv::Mat images
- *
- * @param images the images to be hashed
- * @param d_hash_values the hash values of the images [gpu]
- */
-void GpuDct::stream_dct(std::vector<cv::Mat>& images, unsigned long long int* d_hash_values)
-{
-    const int b_s = 64;
-    int n = images[0].size().width;
-    int n_imgs = images.size();
-    float* g_mat;
-    cudaMalloc(&g_mat, n_imgs * n * n * sizeof(float));
-    int* d_bit_arrays;
-    cudaMalloc(&d_bit_arrays, n_imgs * b_s * sizeof(int));
-    float* tmp;
-    cudaMalloc(&tmp, n_imgs * n * n * sizeof(float));
-    float* DCT;
-    cudaMalloc(&DCT, n_imgs * n * n * sizeof(float));
-    float* d_Transform;
-    cudaMalloc(&d_Transform, n * n * sizeof(float));
-    kernel_get_T<<<n, n>>>(d_Transform);
-    cudaDeviceSynchronize();
-    cublasHandle_t c_handle;
-    cublasCreate(&c_handle);
-
-    // allocate and initialize an array of stream handles
-    std::vector<cudaStream_t> streams(n_imgs);
-    for (int i = 0; i < n_imgs; i++) {
-        cudaStreamCreate(&(streams[i]));
+template<typename T>
+    requires DctScalar<T>
+GpuDct<T>::~GpuDct() {
+    if (m_transform_device) {
+        cudaFreeAsync(m_transform_device, m_stream);
+        m_transform_device = nullptr;
     }
-    for (int i = 0; i < n_imgs; i++) {
-        // do the hash matrix multiplication with streams
-        cudaMemcpyAsync(g_mat + i * n * n, reinterpret_cast<float*>(images[i].data), n * n * sizeof(float), cudaMemcpyHostToDevice, streams[i]);
-        gpu_dct(g_mat + i * n * n, d_bit_arrays + i * b_s, tmp + i * n * n, DCT + i * n * n, d_Transform, n, c_handle, streams[i]);
-    }
-    for (int i = 0; i < n_imgs; i++) {
-        cudaStreamDestroy(streams[i]);
-    }
-    kernel_add_bits<<<n_imgs, 64>>>(d_bit_arrays, d_hash_values);
 
-    // clean up
-    cublasDestroy(c_handle);
-    cudaFree(d_bit_arrays);
-    cudaFree(g_mat);
-    cudaFree(DCT);
-    cudaFree(tmp);
-    cudaFree(d_Transform);
+    if (m_owns_stream && m_stream) {
+        cudaStreamSynchronize(m_stream);
+        cudaStreamDestroy(m_stream);
+    }
 }
 
-/**
- * @brief calculates the DCT hash values of images - the images should be pre-loaded to gpu
- *
- * @param d_image_arr the images on gpu in contigous memory
- * @param d_hash_values the hash values on gpu
- * @param width width of image
- * @param n_imgs number of images
- */
-void GpuDct::stream_dct(const float* d_image_arr, unsigned long long int* d_hash_values, int width, int n_imgs)
+template<typename T>
+    requires DctScalar<T>
+GpuDct<T>::GpuDct(GpuDct&& other) noexcept
+    : m_size(other.m_size)
+    , m_stream(other.m_stream)
+    , m_owns_stream(other.m_owns_stream)
+    , m_pool(std::move(other.m_pool))
+    , m_transform_device(std::exchange(other.m_transform_device, nullptr))
+    , m_transform_ptr(other.m_transform_ptr)
+    , m_transform_elements(other.m_transform_elements)
 {
-    const int b_s = 64;
-    int n = width;
-    int* d_bit_arrays;
-    cudaMalloc(&d_bit_arrays, n_imgs * b_s * sizeof(int));
-    float* tmp;
-    cudaMalloc(&tmp, n_imgs * n * n * sizeof(float));
-    float* DCT;
-    cudaMalloc(&DCT, n_imgs * n * n * sizeof(float));
-    float* d_Transform;
-    cudaMalloc(&d_Transform, n * n * sizeof(float));
-    kernel_get_T<<<n, n>>>(d_Transform);
-    cudaDeviceSynchronize();
-    cublasHandle_t c_handle;
-    cublasCreate(&c_handle);
-
-    // allocate and initialize an array of stream handles
-    std::vector<cudaStream_t> streams(n_imgs);
-    for (int i = 0; i < n_imgs; i++) {
-        cudaStreamCreate(&(streams[i]));
-    }
-    for (int i = 0; i < n_imgs; i++) {
-        // do the hash matrix multiplication with streams
-        gpu_dct(d_image_arr + i * n * n, d_bit_arrays + i * b_s, tmp + i * n * n, DCT + i * n * n, d_Transform, n, c_handle, streams[i]);
-    }
-    for (int i = 0; i < n_imgs; i++) {
-        cudaStreamDestroy(streams[i]);
-    }
-    kernel_add_bits<<<n_imgs, 64>>>(d_bit_arrays, d_hash_values);
-
-    // clean up
-    cublasDestroy(c_handle);
-    cudaFree(d_bit_arrays);
-    cudaFree(DCT);
-    cudaFree(tmp);
-    cudaFree(d_Transform);
+    other.m_stream = nullptr;
+    other.m_owns_stream = false;
+    other.m_transform_ptr = nullptr;
+    other.m_transform_elements = 0;
 }
 
-unsigned long long int GpuDct::gpu_dct_single(const float* A, unsigned long long int* dhash_val)
-{
-    // resetting values
+template<typename T>
+    requires DctScalar<T>
+GpuDct<T>& GpuDct<T>::operator=(GpuDct&& other) noexcept {
+    if (this != &other) {
+        if (m_transform_device) {
+            cudaFreeAsync(m_transform_device, m_stream);
+        }
+    if (m_owns_stream && m_stream) {
+        cudaStreamSynchronize(m_stream);
+        cudaStreamDestroy(m_stream);
+    }
+        m_size = other.m_size;
+        m_stream = other.m_stream;
+        m_owns_stream = other.m_owns_stream;
+        m_pool = std::move(other.m_pool);
+        m_transform_device = std::exchange(other.m_transform_device, nullptr);
+        m_transform_ptr = other.m_transform_ptr;
+        m_transform_elements = other.m_transform_elements;
+
+        other.m_stream = nullptr;
+        other.m_owns_stream = false;
+        other.m_transform_ptr = nullptr;
+        other.m_transform_elements = 0;
+    }
+    return *this;
+}
+
+// ============================================================================
+// Transform Matrix Initialization
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+void GpuDct<T>::init_transform_matrix() {
     const int n = m_size;
+    m_transform_elements = static_cast<size_t>(n) * static_cast<size_t>(n);
 
-    cudaMemset(d_bits, 0, 64 * sizeof(int));
-    cudaMemset(d_tmp, 0, n * n * sizeof(float));
-    cudaMemset(d_DCT, 0, n * n * sizeof(float));
+    auto set_constant_ptr = [&](const ComputeType* symbol_ptr) {
+        m_transform_device = nullptr;
+        m_transform_ptr = symbol_ptr;
+    };
 
-    const float alf = 1;
-    const float bet = 0;
-    const float* alpha = &alf;
-    const float* beta = &bet;
-    // T * A * T'
-    cublasSgemm(m_handle, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, alpha, d_T, n, A, n, beta, d_tmp, n);
-    cublasSgemm(m_handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, alpha, d_tmp, n, d_T, n, beta, d_DCT, n);
-    // binarise the 8x8 DCT values
-    kernel_compute_hash<<<1, 64>>>(d_DCT, d_bits, n);
-    kernel_add_bits<<<1, 64>>>(d_bits, dhash_val);
-    unsigned long long int h_hash;
-    cudaMemcpy(&h_hash, dhash_val, sizeof(unsigned long long int), cudaMemcpyDeviceToHost);
+    if constexpr (std::is_same_v<ComputeType, float>) {
+        if (n == 32) {
+            static std::once_flag flag;
+            std::call_once(flag, [] {
+                auto host = make_dct_transform_array<ComputeType, 32>();
+                throw_on_cuda_error(
+                    cudaMemcpyToSymbol(c_dct_transform_f32_32, host.data(),
+                                       host.size() * sizeof(ComputeType)),
+                    "Failed to upload DCT transform to constant memory");
+            });
+            set_constant_ptr(reinterpret_cast<const ComputeType*>(c_dct_transform_f32_32));
+            return;
+        }
+        if (n == 64) {
+            static std::once_flag flag;
+            std::call_once(flag, [] {
+                auto host = make_dct_transform_array<ComputeType, 64>();
+                throw_on_cuda_error(
+                    cudaMemcpyToSymbol(c_dct_transform_f32_64, host.data(),
+                                       host.size() * sizeof(ComputeType)),
+                    "Failed to upload DCT transform to constant memory");
+            });
+            set_constant_ptr(reinterpret_cast<const ComputeType*>(c_dct_transform_f32_64));
+            return;
+        }
+    }
+
+    if constexpr (std::is_same_v<ComputeType, double>) {
+        if (n == 32) {
+            static std::once_flag flag;
+            std::call_once(flag, [] {
+                auto host = make_dct_transform_array<ComputeType, 32>();
+                throw_on_cuda_error(
+                    cudaMemcpyToSymbol(c_dct_transform_f64_32, host.data(),
+                                       host.size() * sizeof(ComputeType)),
+                    "Failed to upload DCT transform to constant memory");
+            });
+            set_constant_ptr(reinterpret_cast<const ComputeType*>(c_dct_transform_f64_32));
+            return;
+        }
+        if (n == 64) {
+            static std::once_flag flag;
+            std::call_once(flag, [] {
+                auto host = make_dct_transform_array<ComputeType, 64>();
+                throw_on_cuda_error(
+                    cudaMemcpyToSymbol(c_dct_transform_f64_64, host.data(),
+                                       host.size() * sizeof(ComputeType)),
+                    "Failed to upload DCT transform to constant memory");
+            });
+            set_constant_ptr(reinterpret_cast<const ComputeType*>(c_dct_transform_f64_64));
+            return;
+        }
+    }
+
+    // Fallback to device memory for larger matrices or unsupported constant storage
+    auto host_transform = make_dct_transform_vector<ComputeType>(n);
+
+    throw_on_cuda_error(
+        cudaMallocAsync(reinterpret_cast<void**>(&m_transform_device),
+                        m_transform_elements * sizeof(ComputeType),
+                        m_stream),
+        "Failed to allocate transform matrix on device");
+
+    throw_on_cuda_error(
+        cudaMemcpyAsync(m_transform_device, host_transform.data(),
+                         m_transform_elements * sizeof(ComputeType),
+                         cudaMemcpyHostToDevice, m_stream),
+        "Failed to upload transform matrix");
+
+    // Ensure transform ready for external streams
+    throw_on_cuda_error(cudaStreamSynchronize(m_stream),
+                        "Failed to synchronize after transform upload");
+
+    m_transform_ptr = m_transform_device;
+}
+
+// ============================================================================
+// Type Conversion
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+void GpuDct<T>::convert_to_compute_type(const T* d_input, ComputeType* d_output,
+                                        size_t count, cudaStream_t stream) {
+    if (std::is_same<T, ComputeType>::value) {
+        // Same type, no conversion needed - cast both to void* for comparison
+        if (static_cast<const void*>(d_input) != static_cast<const void*>(d_output)) {
+            throw_on_cuda_error(
+                cudaMemcpyAsync(d_output, d_input, count * sizeof(T),
+                                 cudaMemcpyDeviceToDevice, stream),
+                "Failed to copy device data");
+        }
+    } else {
+        // Need conversion
+        constexpr int threads = 256;
+        const int blocks = static_cast<int>((count + threads - 1) / threads);
+        kernel_convert_type<<<blocks, threads, 0, stream>>>(d_input, d_output,
+                                                           static_cast<int>(count));
+        throw_on_cuda_error(cudaGetLastError(),
+                            "Failed to launch type conversion kernel");
+    }
+}
+
+// ============================================================================
+// Single Image DCT - Host Input
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+uint64_t GpuDct<T>::dct_host(std::span<const T> image, cudaStream_t stream) {
+    if (image.size() != static_cast<size_t>(m_size) * static_cast<size_t>(m_size)) {
+        throw std::invalid_argument("dct_host: image span does not match configured size");
+    }
+
+    if (stream == nullptr) stream = m_stream;
+
+    const size_t count = static_cast<size_t>(m_size) * static_cast<size_t>(m_size);
+
+    // Allocate stream-ordered memory
+    StreamMemory<T> d_input(count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_compute(count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_dct_output(count, stream, m_pool->get());
+    StreamMemory<uint64_t> d_hash(1, stream, m_pool->get());
+
+    // Upload image
+    throw_on_cuda_error(
+        cudaMemcpyAsync(d_input.get(), image.data(), count * sizeof(T),
+                         cudaMemcpyHostToDevice, stream),
+        "Failed to copy host image to device");
+
+    // Convert to compute type if needed
+    convert_to_compute_type(d_input.get(), d_compute.get(), count, stream);
+
+    // Launch fused DCT kernel
+    const ComputeType* transform = transform_ptr();
+
+    if (m_size == 32) {
+        kernel_fused_dct_32x32_warp<<<1, 1024, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    } else if (m_size == 64) {
+        dim3 grid(1, 2, 2);
+        dim3 block(32, 32);
+        kernel_fused_dct_64x64<<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    } else if (m_size == 128) {
+        constexpr int tile = 16;
+        constexpr int tiles = (128 + tile - 1) / tile;
+        dim3 grid(1, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 128, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    } else { // 256
+        constexpr int tile = 16;
+        constexpr int tiles = (256 + tile - 1) / tile;
+        dim3 grid(1, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 256, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    }
+
+    throw_on_cuda_error(cudaGetLastError(), "Failed to launch DCT kernel");
+
+    // Download result
+    uint64_t h_hash{};
+    throw_on_cuda_error(
+        cudaMemcpyAsync(&h_hash, d_hash.get(), sizeof(uint64_t),
+                         cudaMemcpyDeviceToHost, stream),
+        "Failed to copy hash to host");
+    throw_on_cuda_error(cudaStreamSynchronize(stream),
+                        "Failed to synchronize dct_host stream");
+
     return h_hash;
 }
 
-// calculates the DCT of an image (needs to be fixed)
-void GpuDct::gpu_dct(const float* A, int* dbit_array, float* tmp, float* DCT, float* d_Transform, const int n, cublasHandle_t handle, cudaStream_t s)
-{
-    const float alf = 1;
-    const float bet = 0;
-    const float* alpha = &alf;
-    const float* beta = &bet;
-    // T * A * T'
-    cublasSetStream(handle, s);
-    cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n, alpha, d_Transform, n, A, n, beta, tmp, n);
-    cublasSetStream(handle, s);
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n, alpha, tmp, n, d_Transform, n, beta, DCT, n);
-    // binarise the 8x8 DCT values
-    kernel_compute_hash<<<1, 64, 0, s>>>(DCT, dbit_array, n);
+// ============================================================================
+// Single Image DCT - Device Input
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+void GpuDct<T>::dct_device(const T* d_image, uint64_t* d_hash_out, cudaStream_t stream) {
+    if (stream == nullptr) stream = m_stream;
+
+    const size_t count = static_cast<size_t>(m_size) * static_cast<size_t>(m_size);
+
+    // Allocate stream-ordered memory
+    StreamMemory<ComputeType> d_compute(count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_dct_output(count, stream, m_pool->get());
+
+    // Convert to compute type if needed
+    convert_to_compute_type(d_image, d_compute.get(), count, stream);
+
+    // Launch fused DCT kernel
+    const ComputeType* transform = transform_ptr();
+
+    if (m_size == 32) {
+        kernel_fused_dct_32x32_warp<<<1, 1024, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash_out);
+    } else if (m_size == 64) {
+        dim3 grid(1, 2, 2);
+        dim3 block(32, 32);
+        kernel_fused_dct_64x64<<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash_out);
+    } else if (m_size == 128) {
+        constexpr int tile = 16;
+        constexpr int tiles = (128 + tile - 1) / tile;
+        dim3 grid(1, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 128, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash_out);
+    } else { // 256
+        constexpr int tile = 16;
+        constexpr int tiles = (256 + tile - 1) / tile;
+        dim3 grid(1, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 256, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash_out);
+    }
+    throw_on_cuda_error(cudaGetLastError(), "Failed to launch DCT kernel");
 }
 
-void GpuDct::getDCTMatrix(const int rows, const int cols, float* d_Transfrom)
-{
-    kernel_get_T<<<rows, cols>>>(d_Transfrom);
+// ============================================================================
+// Async Host DCT
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+void GpuDct<T>::dct_host_async(std::span<const T> image, uint64_t* h_hash_out, cudaStream_t stream) {
+    if (image.size() != static_cast<size_t>(m_size) * static_cast<size_t>(m_size)) {
+        throw std::invalid_argument("dct_host_async: image span does not match configured size");
+    }
+
+    if (stream == nullptr) stream = m_stream;
+
+    const size_t count = static_cast<size_t>(m_size) * static_cast<size_t>(m_size);
+
+    // Allocate stream-ordered memory
+    StreamMemory<T> d_input(count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_compute(count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_dct_output(count, stream, m_pool->get());
+    StreamMemory<uint64_t> d_hash(1, stream, m_pool->get());
+
+    throw_on_cuda_error(
+        cudaMemcpyAsync(d_input.get(), image.data(), count * sizeof(T),
+                         cudaMemcpyHostToDevice, stream),
+        "Failed to copy host image to device");
+
+    convert_to_compute_type(d_input.get(), d_compute.get(), count, stream);
+
+    const ComputeType* transform = transform_ptr();
+
+    if (m_size == 32) {
+        kernel_fused_dct_32x32_warp<<<1, 1024, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    } else if (m_size == 64) {
+        dim3 grid(1, 2, 2);
+        dim3 block(32, 32);
+        kernel_fused_dct_64x64<<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    } else if (m_size == 128) {
+        constexpr int tile = 16;
+        constexpr int tiles = (128 + tile - 1) / tile;
+        dim3 grid(1, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 128, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    } else {
+        constexpr int tile = 16;
+        constexpr int tiles = (256 + tile - 1) / tile;
+        dim3 grid(1, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 256, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, 1, d_hash.get());
+    }
+
+    throw_on_cuda_error(cudaGetLastError(), "Failed to launch DCT kernel");
+
+    throw_on_cuda_error(
+        cudaMemcpyAsync(h_hash_out, d_hash.get(), sizeof(uint64_t),
+                         cudaMemcpyDeviceToHost, stream),
+        "Failed to copy hash to host");
 }
+
+// ============================================================================
+// Batch DCT - Host Input
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+void GpuDct<T>::batch_dct_host(std::span<const T> images, std::span<uint64_t> hashes,
+                               cudaStream_t stream) {
+    if (hashes.empty()) {
+        return;
+    }
+
+    const size_t expected = static_cast<size_t>(m_size) * static_cast<size_t>(m_size) * hashes.size();
+    if (images.size() != expected) {
+        throw std::invalid_argument("batch_dct_host: image span does not match batch size");
+    }
+
+    if (stream == nullptr) stream = m_stream;
+
+    const size_t element_count = static_cast<size_t>(m_size) * static_cast<size_t>(m_size) * hashes.size();
+
+    // Allocate stream-ordered memory
+    StreamMemory<T> d_input(element_count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_compute(element_count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_dct_output(element_count, stream, m_pool->get());
+    StreamMemory<uint64_t> d_hashes(hashes.size(), stream, m_pool->get());
+
+    throw_on_cuda_error(
+        cudaMemcpyAsync(d_input.get(), images.data(), element_count * sizeof(T),
+                         cudaMemcpyHostToDevice, stream),
+        "Failed to copy batched images to device");
+
+    convert_to_compute_type(d_input.get(), d_compute.get(), element_count, stream);
+
+    const ComputeType* transform = transform_ptr();
+    const int batch_size = static_cast<int>(hashes.size());
+
+    if (m_size == 32) {
+        kernel_fused_dct_32x32_warp<<<batch_size, 1024, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes.get());
+    } else if (m_size == 64) {
+        dim3 grid(batch_size, 2, 2);
+        dim3 block(32, 32);
+        kernel_fused_dct_64x64<<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes.get());
+    } else if (m_size == 128) {
+        constexpr int tile = 16;
+        constexpr int tiles = (128 + tile - 1) / tile;
+        dim3 grid(batch_size, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 128, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes.get());
+    } else {
+        constexpr int tile = 16;
+        constexpr int tiles = (256 + tile - 1) / tile;
+        dim3 grid(batch_size, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 256, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes.get());
+    }
+
+    throw_on_cuda_error(cudaGetLastError(), "Failed to launch batched DCT kernel");
+
+    throw_on_cuda_error(
+        cudaMemcpyAsync(hashes.data(), d_hashes.get(), hashes.size() * sizeof(uint64_t),
+                         cudaMemcpyDeviceToHost, stream),
+        "Failed to copy batched hashes to host");
+
+    throw_on_cuda_error(cudaStreamSynchronize(stream),
+                        "Failed to synchronize batch_dct_host stream");
+}
+
+// ============================================================================
+// Batch DCT - Device Input
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+void GpuDct<T>::batch_dct_device(const T* d_images, uint64_t* d_hashes, 
+                                 int batch_size, cudaStream_t stream) {
+    if (batch_size <= 0) {
+        if (batch_size < 0) {
+            throw std::invalid_argument("batch_dct_device: negative batch size");
+        }
+        return;
+    }
+
+    if (stream == nullptr) stream = m_stream;
+    
+    const int n = m_size;
+    const size_t count = static_cast<size_t>(n) * static_cast<size_t>(n) * batch_size;
+    
+    // Allocate stream-ordered memory
+    StreamMemory<ComputeType> d_compute(count, stream, m_pool->get());
+    StreamMemory<ComputeType> d_dct_output(count, stream, m_pool->get());
+    
+    // Convert to compute type if needed
+    convert_to_compute_type(d_images, d_compute.get(), count, stream);
+    
+    // Launch batched fused DCT kernel
+    const ComputeType* transform = transform_ptr();
+    
+    if (n == 32) {
+        kernel_fused_dct_32x32_warp<<<batch_size, 1024, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes
+        );
+    } else if (n == 64) {
+        dim3 grid(batch_size, 2, 2);
+        dim3 block(32, 32);
+        kernel_fused_dct_64x64<<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes
+        );
+    } else if (n == 128) {
+        constexpr int tile = 16;
+        constexpr int tiles = (128 + tile - 1) / tile;
+        dim3 grid(batch_size, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 128, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes
+        );
+    } else { // 256
+        constexpr int tile = 16;
+        constexpr int tiles = (256 + tile - 1) / tile;
+        dim3 grid(batch_size, tiles, tiles);
+        dim3 block(tile, tile);
+        kernel_fused_dct_general<ComputeType, 256, 16><<<grid, block, 0, stream>>>(
+            d_compute.get(), d_dct_output.get(), transform, batch_size, d_hashes
+        );
+    }
+
+    throw_on_cuda_error(cudaGetLastError(), "Failed to launch batched DCT kernel");
+}
+
+// ============================================================================
+// Multi-Stream Batch DCT
+// ============================================================================
+
+template<typename T>
+    requires DctScalar<T>
+void GpuDct<T>::batch_dct_device_multistream(const T* d_images, uint64_t* d_hashes,
+                                             int batch_size, std::span<cudaStream_t> streams) {
+    if (batch_size <= 0) {
+        if (batch_size < 0) {
+            throw std::invalid_argument("batch_dct_device_multistream: negative batch size");
+        }
+        return;
+    }
+
+    if (streams.empty()) {
+        throw std::invalid_argument("batch_dct_device_multistream: no streams provided");
+    }
+
+    const int images_per_stream = (batch_size + static_cast<int>(streams.size()) - 1)
+                                  / static_cast<int>(streams.size());
+
+    for (size_t s = 0; s < streams.size(); ++s) {
+        const int start_idx = static_cast<int>(s) * images_per_stream;
+        const int count = std::min(images_per_stream, batch_size - start_idx);
+
+        if (count <= 0) break;
+
+        batch_dct_device(d_images + static_cast<size_t>(start_idx) * m_size * m_size,
+                         d_hashes + start_idx,
+                         count,
+                         streams[s]);
+    }
+
+    for (cudaStream_t stream : streams) {
+        if (stream) {
+            throw_on_cuda_error(cudaStreamSynchronize(stream),
+                                "Failed to synchronize multi-stream batch");
+        }
+    }
+}
+
+// ============================================================================
+// Explicit Template Instantiations
+// ============================================================================
+
+template class GpuDct<float>;
+template class GpuDct<double>;
+template class GpuDct<int>;
+template class GpuDct<unsigned int>;
+template class GpuDct<uint8_t>;
+template class GpuDct<int8_t>;
+template class GpuDct<uint16_t>;
+template class GpuDct<int16_t>;
+
+} // namespace gpu_dct

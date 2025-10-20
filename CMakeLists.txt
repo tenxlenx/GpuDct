@@ -1,43 +1,85 @@
-cmake_minimum_required(VERSION 3.26)
+cmake_minimum_required(VERSION 3.18)
 project(GpuDct CUDA CXX)
-set(CMAKE_CUDA_ARCHITECTURES 89)
-set(CMAKE_CUDA_STANDARD 17)
 
-find_package(OpenCV CONFIG REQUIRED)
+# CUDA settings
+set(CMAKE_CUDA_STANDARD 20)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Set CUDA architectures (adjust for your GPU)
+# 75 = Turing (RTX 20xx), 80/86 = Ampere (RTX 30xx), 89 = Ada (RTX 40xx)
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES 75 80 86 89)
+endif()
+
 find_package(CUDAToolkit REQUIRED)
 
-add_library(${PROJECT_NAME} STATIC src/gpu_dct.cu
-        include/gpu_dct.cuh)
-
-include_directories(
-        ${OpenCV_INCLUDE_DIRS}
-        ${CUDAToolkit_INCLUDE_DIRS}
+# Main library
+add_library(${PROJECT_NAME} STATIC 
+    src/gpu_dct.cu
+    src/gpu_dct_impl.cuh
+    include/gpu_dct.cuh
 )
 
+# Compiler options
+target_compile_options(${PROJECT_NAME} PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        --use_fast_math
+        --expt-relaxed-constexpr
+        -O3
+    >
+)
+
+# Enable separable compilation for device linking
 set_target_properties(${PROJECT_NAME} PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    POSITION_INDEPENDENT_CODE ON
+)
 
-target_link_libraries(${PROJECT_NAME}
-        ${OpenCV_LIBS}
-        CUDA::cudart
-        CUDA::cublas
-        CUDA::cublasLt
-        CUDA::cufft
-        CUDA::cusolver
-        CUDA::cuda_driver)
+# Link CUDA libraries (only cudart needed, no cuBLAS)
+target_link_libraries(${PROJECT_NAME} PUBLIC
+    CUDA::cudart
+)
 
-
-# Set include directories for your library
+# Include directories
 target_include_directories(${PROJECT_NAME} PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-# Set output directory for the library file
-set_target_properties(${PROJECT_NAME} PROPERTIES
-        ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/lib
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
 )
 
+# Installation
 install(TARGETS ${PROJECT_NAME}
-        EXPORT ${PROJECT_NAME}Targets
-        ARCHIVE DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/lib
+    EXPORT ${PROJECT_NAME}Targets
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin
 )
-install(DIRECTORY include/ DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/include)
+
+install(DIRECTORY include/ 
+    DESTINATION include
+    FILES_MATCHING PATTERN "*.cuh" PATTERN "*.h"
+)
+
+install(EXPORT ${PROJECT_NAME}Targets
+    FILE ${PROJECT_NAME}Targets.cmake
+    NAMESPACE ${PROJECT_NAME}::
+    DESTINATION lib/cmake/${PROJECT_NAME}
+)
+
+# Create package config file
+include(CMakePackageConfigHelpers)
+configure_package_config_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GpuDctConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake
+    INSTALL_DESTINATION lib/cmake/${PROJECT_NAME}
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}Config.cmake
+    DESTINATION lib/cmake/${PROJECT_NAME}
+)
+
+# Examples subdirectory
+add_subdirectory(examples)

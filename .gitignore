@@ -1,0 +1,45 @@
+# Build directories
+build/
+CMakeFiles/
+
+# CMake generated files
+CMakeCache.txt
+cmake_install.cmake
+*.cmake
+Makefile
+install_manifest.txt
+CTestTestfile.cmake
+Testing/
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.lo
+*.la
+*.a
+*.so
+*.dll
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# CUDA-specific intermediates
+*.cubin
+*.ptx
+*.fatbin
+*.sass
+
+# IDE and editor artifacts
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+
+# Profiling and logs
+*.nvvp
+*.nsight*
+*.log
