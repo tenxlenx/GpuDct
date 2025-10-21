@@ -1,77 +1,148 @@
-# GpuDct: CUDA-accelerated DCT Hash Calculation Library
+# GpuDct: CUDA DCT Hashing Library
 
-GpuDct is a C++ library that enables the fast extraction of Discrete Cosine Transform (DCT) hashes using NVIDIA's CUDA architecture. This library leverages GPU acceleration to provide efficient and high-performance hash computation.
+GpuDct is a CUDA C++20 library that computes 64-bit perceptual hashes from square images using fused Discrete Cosine Transform (DCT) kernels. Each kernel evaluates the full T * A * T' pipeline, extracts the 8x8 low-frequency block on device, and emits a median-threshold signature without extra launches or host round trips.
 
-## Features
-- GPU-accelerated DCT hash computation
-- Built with C++ and CUDA
-- Utilizes cuBLAS and other CUDA libraries for optimization
-- Seamless integration with OpenCV
-- Easy-to-use CMake configuration
+## Highlights
+- Fused single-pass kernels for 32, 64, 128, and 256 sized images with constant-memory transforms
+- Stream-ordered temporary allocations via CUDA memory pools (no hot-path malloc)
+- In-kernel 8x8 hashing and median selection yielding a 64-bit binary fingerprint
+- Batch and multi-stream helpers for high-throughput pipelines
+- CMake package configured for CUDA + C++20, friendly with FetchContent and install exports
 
 ## Requirements
-- CUDA Toolkit
-- OpenCV
-- CMake (version 3.26 or you can set it lower)
-- A compatible NVIDIA GPU (Architecture 8.9 is set but you can edit it)
+- NVIDIA GPU with compute capability 7.5 or newer (tune `CMAKE_CUDA_ARCHITECTURES` as needed)
+- CUDA Toolkit 12.x (tested) with `nvcc`
+- CMake 3.18 or newer
+- Host compiler with full C++20 support (GCC 11+, Clang 14+, MSVC 19.3+)
 
-## Installation
+## Quick Start
 
-To incorporate GpuDct into your project, you can use CMake's FetchContent module. You can fork this project and setup with your project URL. The example below demonstrates how to set up a simple CMake project that depends on GpuDct.
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+```
+
+Outputs include `libGpuDct.a` and sample binaries under `build/examples/`. Sanity check performance with:
+
+```bash
+./build/examples/gpu_dct_benchmark        # defaults to 32x32
+./build/examples/gpu_dct_benchmark 256    # alternate size
+```
+
+## Basic Tutorial
+
+The primary entry point is `gpu_dct::GpuDct<T>`. Supported image sizes are 32, 64, 128, and 256.
+
+### 1. Single image hashing from host memory
+
+```cpp
+#include <gpu_dct.cuh>
+#include <vector>
+#include <cstdint>
+#include <iostream>
+
+int main() {
+    constexpr int N = 32;
+    gpu_dct::GpuDct<float> dct(N);
+
+    std::vector<float> image(N * N);
+    for (size_t i = 0; i < image.size(); ++i) {
+        image[i] = static_cast<float>(i % 256);
+    }
+
+    const uint64_t hash = dct.dct_host(image.data());
+    std::cout << "hash: 0x" << std::hex << hash << std::dec << "\n";
+    return 0;
+}
+```
+
+`dct_host` is synchronous and optionally accepts a CUDA stream to integrate with existing GPU work.
+
+### 2. Batched host processing
+
+```cpp
+constexpr int N = 64;
+constexpr int batch = 16;
+gpu_dct::GpuDct<float> dct(N);
+
+std::vector<float> images(static_cast<size_t>(N) * N * batch);
+std::vector<uint64_t> hashes(batch);
+
+dct.batch_dct_host(images.data(), hashes.data(), batch);
+```
+
+The helper stages data through stream-ordered pools, launches fused kernels for the entire batch, and returns once hashes are copied back.
+
+### 3. Device-to-device workflows and multi-stream execution
+
+```cpp
+#include <array>
+
+gpu_dct::GpuDct<float> dct(128);
+constexpr int batch = 64;
+
+float* d_images = nullptr;
+uint64_t* d_hashes = nullptr;
+cudaMalloc(&d_images, 128 * 128 * batch * sizeof(float));
+cudaMalloc(&d_hashes, batch * sizeof(uint64_t));
+
+// populate d_images on device...
+
+dct.batch_dct_device(d_images, d_hashes, batch);
+
+std::array<cudaStream_t, 4> streams{};
+for (auto& s : streams) {
+    cudaStreamCreate(&s);
+}
+
+dct.batch_dct_device_multistream(d_images, d_hashes, batch, streams);
+
+for (auto s : streams) {
+    cudaStreamDestroy(s);
+}
+
+cudaFree(d_images);
+cudaFree(d_hashes);
+```
+
+Hashes remain on the device, enabling additional GPU-side comparisons before any host transfer.
+
+## Using GpuDct in another CMake project
 
 ```cmake
-cmake_minimum_required(VERSION 3.26)
-project(testproject CUDA CXX)
-
-# Set CUDA architecture and standard
-set(CMAKE_CUDA_ARCHITECTURES 89)
-set(CMAKE_CUDA_STANDARD 17)
-
-# Find required packages
-find_package(OpenCV CONFIG REQUIRED)
-find_package(CUDAToolkit REQUIRED)
-
-# Include directories for dependencies
-include_directories(
-        ${OpenCV_INCLUDE_DIRS}
-        ${CUDAToolkit_INCLUDE_DIRS}
-)
-
-# Fetch GpuDct from its Git repository
 include(FetchContent)
 FetchContent_Declare(
-        GpuDct
-        GIT_REPOSITORY https://github.com/tenxlenx/GpuDct.git
-        GIT_TAG main
+    GpuDct
+    GIT_REPOSITORY https://github.com/tenxlenx/GpuDct.git
+    GIT_TAG main
 )
 
-# Configure and build GpuDct if it is not already populated
-FetchContent_GetProperties(GpuDct)
-if(NOT GpuDct_POPULATED)
-    FetchContent_Populate(GpuDct)
-    add_subdirectory(${gpudct_SOURCE_DIR} ${gpudct_BINARY_DIR})
-endif()
+FetchContent_MakeAvailable(GpuDct)
 
-# Create the main project executable
-add_executable(${PROJECT_NAME} main.cpp)
+add_executable(hash_demo main.cpp)
+target_link_libraries(hash_demo PRIVATE GpuDct CUDA::cudart)
+set_property(TARGET hash_demo PROPERTY CXX_STANDARD 20)
+```
 
-# Enable CUDA separable compilation
-set_target_properties(${PROJECT_NAME} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+Override `CMAKE_CUDA_ARCHITECTURES` in the parent project to match deployment hardware.
 
-# Link libraries
-target_link_libraries(${PROJECT_NAME} PRIVATE
-        GpuDct
-        ${OpenCV_LIBS}
-        CUDA::cudart
-        CUDA::cublas
-        CUDA::cublasLt
-        CUDA::cufft
-        CUDA::cusolver
-        CUDA::cuda_driver
-)
+## Benchmarking
 
-# Specify target include directories
-target_include_directories(${PROJECT_NAME} PRIVATE
-        $<BUILD_INTERFACE:${gpudct_SOURCE_DIR}/include>
-        $<INSTALL_INTERFACE:include>
-)
+`examples/gpu_dct_benchmark` exercises single images, batched runs, and multi-stream scenarios. CLI usage:
+
+```
+./gpu_dct_benchmark                # 32x32, default iterations
+./gpu_dct_benchmark 128            # choose image size
+./gpu_dct_benchmark 64 --streams 4 # adjust streams or iterations
+```
+
+The tool reports per-image latency, throughput, and data type comparisons for quick regression checks.
+
+## Troubleshooting
+- Mismatch between compiled and runtime GPU architectures: set `CMAKE_CUDA_ARCHITECTURES` explicitly.
+- Out-of-memory during large batches: raise the CUDA malloc heap limit or reduce concurrent streams.
+- Integrating with pre-existing CUDA streams: pass your stream to constructors or method overloads to preserve ordering.
+
+## License
+
+MIT. See `LICENSE` for details.
