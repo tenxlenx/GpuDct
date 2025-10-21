@@ -15,7 +15,25 @@
 #include <utility>
 #include <vector>
 
-// Namespace for GPU DCT library
+/**
+ * @brief GPU-accelerated Discrete Cosine Transform (DCT) library
+ *
+ * This namespace provides high-performance GPU implementations for computing
+ * DCT-based perceptual hashes of images. The library is optimized for common
+ * image sizes (32x32, 64x64, 128x128, 256x256) and supports various data types
+ * through templating.
+ *
+ * Key features:
+ * - Stream-ordered memory allocation for zero-overhead async operations
+ * - Fused DCT kernels with constant memory optimization
+ * - Batch processing with single and multi-stream support
+ * - Type-safe interface supporting float, double, and integral types
+ * - RAII-based resource management
+ *
+ * @see GpuDct Main DCT computation class
+ * @see StreamMemory Stream-ordered memory allocation wrapper
+ * @see StreamMemoryPool Memory pool for efficient allocation reuse
+ */
 namespace gpu_dct {
 
 // Constants for DCT transform matrices in constant memory
@@ -48,6 +66,17 @@ concept DctScalar = std::is_arithmetic_v<T>;
  */
 template <typename T> class StreamMemory {
   public:
+    /**
+     * @brief Construct a new StreamMemory object
+     *
+     * Allocates memory asynchronously from the specified stream, optionally
+     * using a memory pool for efficient reuse.
+     *
+     * @param count Number of elements to allocate
+     * @param stream CUDA stream for stream-ordered allocation
+     * @param pool Optional memory pool (nullptr for default allocation)
+     * @throws std::runtime_error if allocation fails
+     */
     StreamMemory(size_t count, cudaStream_t stream,
                  cudaMemPool_t pool = nullptr)
         : m_ptr(nullptr), m_stream(stream), m_count(count) {
@@ -69,6 +98,11 @@ template <typename T> class StreamMemory {
         }
     }
 
+    /**
+     * @brief Destroy the StreamMemory object
+     *
+     * Asynchronously frees the allocated memory in stream order.
+     */
     ~StreamMemory() {
         if (m_ptr) {
             cudaFreeAsync(m_ptr, m_stream);
@@ -79,12 +113,26 @@ template <typename T> class StreamMemory {
     StreamMemory(const StreamMemory &) = delete;
     StreamMemory &operator=(const StreamMemory &) = delete;
 
-    // Movable
+    /**
+     * @brief Move constructor
+     *
+     * Transfers ownership of the memory allocation from another StreamMemory.
+     *
+     * @param other Source StreamMemory object (left in valid but unspecified state)
+     */
     StreamMemory(StreamMemory &&other) noexcept
         : m_ptr(std::exchange(other.m_ptr, nullptr)),
           m_stream(std::exchange(other.m_stream, cudaStream_t{})),
           m_count(std::exchange(other.m_count, size_t{0})) {}
 
+    /**
+     * @brief Move assignment operator
+     *
+     * Frees current allocation and transfers ownership from another StreamMemory.
+     *
+     * @param other Source StreamMemory object
+     * @return Reference to this object
+     */
     StreamMemory &operator=(StreamMemory &&other) noexcept {
         if (this != &other) {
             if (m_ptr) {
@@ -97,21 +145,63 @@ template <typename T> class StreamMemory {
         return *this;
     }
 
+    /**
+     * @brief Get mutable pointer to allocated memory
+     *
+     * @return Pointer to allocated memory of type T
+     */
     [[nodiscard]] T *get() { return static_cast<T *>(m_ptr); }
+    
+    /**
+     * @brief Get const pointer to allocated memory
+     *
+     * @return Const pointer to allocated memory of type T
+     */
     [[nodiscard]] const T *get() const { return static_cast<const T *>(m_ptr); }
+    
+    /**
+     * @brief Get number of allocated elements
+     *
+     * @return Number of elements of type T that were allocated
+     */
     [[nodiscard]] size_t count() const { return m_count; }
 
   private:
-    void *m_ptr;
-    cudaStream_t m_stream;
-    size_t m_count;
+    void *m_ptr;           ///< Pointer to allocated device memory
+    cudaStream_t m_stream; ///< CUDA stream associated with this allocation
+    size_t m_count;        ///< Number of elements allocated
 };
 
 /**
  * @brief Stream-ordered memory pool for efficient allocation reuse
+ *
+ * Provides a CUDA memory pool that enables fast reallocation of device memory
+ * without the overhead of repeated cudaMalloc/cudaFree calls. Memory is kept
+ * allocated and reused across multiple operations, improving performance for
+ * workloads with frequent allocations.
+ *
+ * The pool is configured with:
+ * - Pinned allocations for optimal performance
+ * - Maximum release threshold to prevent automatic memory release
+ * - Device-local memory storage
+ *
+ * This class is non-copyable but can be moved. Memory is automatically
+ * released when the pool is destroyed.
+ *
+ * @note Memory pool is automatically destroyed in the destructor
+ * @see StreamMemory for allocating from this pool
  */
 class StreamMemoryPool {
   public:
+    /**
+     * @brief Construct a new StreamMemoryPool object
+     *
+     * Creates a CUDA memory pool with pinned allocations on the current device.
+     * The pool is configured to retain all allocated memory (release threshold
+     * set to maximum) to maximize reuse efficiency.
+     *
+     * @throws std::runtime_error if pool creation or configuration fails
+     */
     StreamMemoryPool() : m_pool(nullptr) {
         cudaMemPoolProps props = {};
         props.allocType = cudaMemAllocationTypePinned;
@@ -130,6 +220,11 @@ class StreamMemoryPool {
             "Failed to configure memory pool");
     }
 
+    /**
+     * @brief Destroy the StreamMemoryPool object
+     *
+     * Destroys the underlying CUDA memory pool and releases all associated memory.
+     */
     ~StreamMemoryPool() {
         if (m_pool) {
             cudaMemPoolDestroy(m_pool);
@@ -140,10 +235,18 @@ class StreamMemoryPool {
     StreamMemoryPool(const StreamMemoryPool &) = delete;
     StreamMemoryPool &operator=(const StreamMemoryPool &) = delete;
 
+    /**
+     * @brief Get the underlying CUDA memory pool handle
+     *
+     * Returns the raw CUDA memory pool handle that can be passed to
+     * cudaMallocFromPoolAsync and other CUDA memory pool APIs.
+     *
+     * @return cudaMemPool_t handle to the underlying memory pool
+     */
     [[nodiscard]] cudaMemPool_t get() const { return m_pool; }
 
   private:
-    cudaMemPool_t m_pool;
+    cudaMemPool_t m_pool; ///< CUDA memory pool handle
 };
 
 /**

@@ -16,10 +16,29 @@
 #include <string_view>
 #include <vector>
 
+/**
+ * @namespace gpu_dct
+ * @brief GPU-accelerated Discrete Cosine Transform implementation
+ * 
+ * This namespace provides GPU-accelerated DCT computation with support for
+ * single and batched operations, multiple data types, and stream-based
+ * asynchronous execution.
+ */
 namespace gpu_dct {
 
 namespace {
 
+/**
+ * @brief Fills a buffer with DCT transform coefficients
+ * 
+ * Computes the Type-II DCT transform matrix coefficients using the formula:
+ * T[i,j] = scale * cos(π * i * (2j + 1) / (2n))
+ * where scale = sqrt(1/n) for i=0, sqrt(2/n) otherwise
+ * 
+ * @tparam ComputeType Floating-point type for computation (float or double)
+ * @param out Output buffer to store transform coefficients (size n*n)
+ * @param n Size of the DCT transform (matrix dimension)
+ */
 template <typename ComputeType>
 void fill_dct_transform(ComputeType *out, int n) {
     const ComputeType pi = static_cast<ComputeType>(3.14159265358979323846);
@@ -34,6 +53,13 @@ void fill_dct_transform(ComputeType *out, int n) {
     }
 }
 
+/**
+ * @brief Creates a compile-time DCT transform matrix as an array
+ * 
+ * @tparam ComputeType Floating-point type for computation
+ * @tparam N Size of the DCT transform (compile-time constant)
+ * @return std::array<ComputeType, N*N> DCT transform matrix
+ */
 template <typename ComputeType, int N>
 std::array<ComputeType, static_cast<size_t>(N) * N> make_dct_transform_array() {
     std::array<ComputeType, static_cast<size_t>(N) * N> result{};
@@ -41,6 +67,13 @@ std::array<ComputeType, static_cast<size_t>(N) * N> make_dct_transform_array() {
     return result;
 }
 
+/**
+ * @brief Creates a runtime-sized DCT transform matrix as a vector
+ * 
+ * @tparam ComputeType Floating-point type for computation
+ * @param n Size of the DCT transform (runtime value)
+ * @return std::vector<ComputeType> DCT transform matrix of size n*n
+ */
 template <typename ComputeType>
 std::vector<ComputeType> make_dct_transform_vector(int n) {
     std::vector<ComputeType> result(static_cast<size_t>(n) *
@@ -55,6 +88,13 @@ std::vector<ComputeType> make_dct_transform_vector(int n) {
 // Template Class Implementation
 // ============================================================================
 
+/**
+ * @brief Throws std::runtime_error if CUDA error occurred
+ * 
+ * @param error CUDA error code to check
+ * @param context Descriptive context string to include in error message
+ * @throws std::runtime_error if error != cudaSuccess
+ */
 void throw_on_cuda_error(cudaError_t error, std::string_view context) {
     if (error != cudaSuccess) {
         throw std::runtime_error(std::string(context) + ": " +
@@ -62,6 +102,18 @@ void throw_on_cuda_error(cudaError_t error, std::string_view context) {
     }
 }
 
+/**
+ * @brief Constructs a GpuDct instance for a specific transform size
+ * 
+ * Initializes the GPU DCT transformer with the specified size and optional
+ * CUDA stream. Allocates necessary resources including transform matrices
+ * and memory pools.
+ * 
+ * @tparam T Input data type (must satisfy DctScalar concept)
+ * @param n DCT transform size (must be 32, 64, 128, or 256)
+ * @param stream CUDA stream for operations (nullptr creates a new stream)
+ * @throws std::runtime_error if n is not a supported size or CUDA errors occur
+ */
 template <typename T>
     requires DctScalar<T>
 GpuDct<T>::GpuDct(int n, cudaStream_t stream)
@@ -108,6 +160,12 @@ GpuDct<T>::GpuDct(int n, cudaStream_t stream)
     }
 }
 
+/**
+ * @brief Destructor - cleans up GPU resources
+ * 
+ * Synchronizes and destroys the CUDA stream if owned, and frees device memory
+ * for transform matrices.
+ */
 template <typename T>
     requires DctScalar<T>
 GpuDct<T>::~GpuDct() {
@@ -122,6 +180,11 @@ GpuDct<T>::~GpuDct() {
     }
 }
 
+/**
+ * @brief Move constructor
+ * 
+ * @param other GpuDct instance to move from
+ */
 template <typename T>
     requires DctScalar<T>
 GpuDct<T>::GpuDct(GpuDct &&other) noexcept
@@ -136,6 +199,12 @@ GpuDct<T>::GpuDct(GpuDct &&other) noexcept
     other.m_transform_elements = 0;
 }
 
+/**
+ * @brief Move assignment operator
+ * 
+ * @param other GpuDct instance to move from
+ * @return Reference to this instance
+ */
 template <typename T>
     requires DctScalar<T>
 GpuDct<T> &GpuDct<T>::operator=(GpuDct &&other) noexcept {
@@ -167,6 +236,15 @@ GpuDct<T> &GpuDct<T>::operator=(GpuDct &&other) noexcept {
 // Transform Matrix Initialization
 // ============================================================================
 
+/**
+ * @brief Initializes the DCT transform matrix on the GPU
+ * 
+ * Uploads the DCT transform matrix to either constant memory (for smaller
+ * sizes with supported types) or global device memory. Uses std::call_once
+ * to ensure constant memory is initialized only once per symbol.
+ * 
+ * @throws std::runtime_error if memory allocation or upload fails
+ */
 template <typename T>
     requires DctScalar<T>
 void GpuDct<T>::init_transform_matrix() {
@@ -262,6 +340,18 @@ void GpuDct<T>::init_transform_matrix() {
 // Type Conversion
 // ============================================================================
 
+/**
+ * @brief Converts input data to compute type on the GPU
+ * 
+ * If T and ComputeType are the same, performs a device-to-device copy.
+ * Otherwise, launches a kernel to convert types element-wise.
+ * 
+ * @param d_input Device pointer to input data
+ * @param d_output Device pointer to output buffer
+ * @param count Number of elements to convert
+ * @param stream CUDA stream for the operation
+ * @throws std::runtime_error if CUDA operations fail
+ */
 template <typename T>
     requires DctScalar<T>
 void GpuDct<T>::convert_to_compute_type(const T *d_input, ComputeType *d_output,
@@ -290,6 +380,18 @@ void GpuDct<T>::convert_to_compute_type(const T *d_input, ComputeType *d_output,
 // Single Image DCT - Host Input
 // ============================================================================
 
+/**
+ * @brief Computes DCT hash for a single image from host memory (synchronous)
+ * 
+ * Uploads image data, performs DCT transform, computes perceptual hash,
+ * and returns the result synchronously.
+ * 
+ * @param image Input image data (size must match n*n)
+ * @param stream CUDA stream for operations (nullptr uses default stream)
+ * @return uint64_t Computed perceptual hash value
+ * @throws std::invalid_argument if image size doesn't match
+ * @throws std::runtime_error if CUDA operations fail
+ */
 template <typename T>
     requires DctScalar<T>
 uint64_t GpuDct<T>::dct_host(std::span<const T> image, cudaStream_t stream) {
@@ -366,6 +468,17 @@ uint64_t GpuDct<T>::dct_host(std::span<const T> image, cudaStream_t stream) {
 // Single Image DCT - Device Input
 // ============================================================================
 
+/**
+ * @brief Computes DCT hash for a single image from device memory (asynchronous)
+ * 
+ * Performs DCT transform and hash computation on device memory.
+ * The result is written to device memory without host synchronization.
+ * 
+ * @param d_image Device pointer to input image (size n*n)
+ * @param d_hash_out Device pointer to output hash location
+ * @param stream CUDA stream for operations (nullptr uses default stream)
+ * @throws std::runtime_error if CUDA operations fail
+ */
 template <typename T>
     requires DctScalar<T>
 void GpuDct<T>::dct_device(const T *d_image, uint64_t *d_hash_out,
@@ -418,6 +531,18 @@ void GpuDct<T>::dct_device(const T *d_image, uint64_t *d_hash_out,
 // Async Host DCT
 // ============================================================================
 
+/**
+ * @brief Computes DCT hash for a single image asynchronously from host memory
+ * 
+ * Uploads image, performs DCT and hashing, and asynchronously copies result
+ * to pinned host memory. Caller must synchronize before accessing result.
+ * 
+ * @param image Input image data (size must match n*n)
+ * @param h_hash_out Host pointer to output hash (must be pinned memory)
+ * @param stream CUDA stream for operations (nullptr uses default stream)
+ * @throws std::invalid_argument if image size doesn't match
+ * @throws std::runtime_error if CUDA operations fail
+ */
 template <typename T>
     requires DctScalar<T>
 void GpuDct<T>::dct_host_async(std::span<const T> image, uint64_t *h_hash_out,
@@ -487,6 +612,18 @@ void GpuDct<T>::dct_host_async(std::span<const T> image, uint64_t *h_hash_out,
 // Batch DCT - Host Input
 // ============================================================================
 
+/**
+ * @brief Computes DCT hashes for multiple images from host memory (synchronous)
+ * 
+ * Processes a batch of images in a single GPU operation, uploading all images,
+ * computing DCTs in parallel, and returning all hashes synchronously.
+ * 
+ * @param images Contiguous span of image data (size = n*n*batch_count)
+ * @param hashes Output span for hash results (size determines batch count)
+ * @param stream CUDA stream for operations (nullptr uses default stream)
+ * @throws std::invalid_argument if images size doesn't match batch count
+ * @throws std::runtime_error if CUDA operations fail
+ */
 template <typename T>
     requires DctScalar<T>
 void GpuDct<T>::batch_dct_host(std::span<const T> images,
@@ -571,6 +708,19 @@ void GpuDct<T>::batch_dct_host(std::span<const T> images,
 // Batch DCT - Device Input
 // ============================================================================
 
+/**
+ * @brief Computes DCT hashes for multiple images from device memory (asynchronous)
+ * 
+ * Processes a batch of images already on the GPU, writing results to device memory.
+ * No host synchronization is performed.
+ * 
+ * @param d_images Device pointer to batched image data (size = n*n*batch_size)
+ * @param d_hashes Device pointer to output hash array (size = batch_size)
+ * @param batch_size Number of images in the batch
+ * @param stream CUDA stream for operations (nullptr uses default stream)
+ * @throws std::invalid_argument if batch_size is negative
+ * @throws std::runtime_error if CUDA operations fail
+ */
 template <typename T>
     requires DctScalar<T>
 void GpuDct<T>::batch_dct_device(const T *d_images, uint64_t *d_hashes,
@@ -636,6 +786,19 @@ void GpuDct<T>::batch_dct_device(const T *d_images, uint64_t *d_hashes,
 // Multi-Stream Batch DCT
 // ============================================================================
 
+/**
+ * @brief Computes DCT hashes using multiple CUDA streams for parallelism
+ * 
+ * Distributes the batch across multiple streams to enable concurrent execution.
+ * Synchronizes all streams before returning.
+ * 
+ * @param d_images Device pointer to batched image data
+ * @param d_hashes Device pointer to output hash array
+ * @param batch_size Total number of images to process
+ * @param streams Span of CUDA streams to distribute work across
+ * @throws std::invalid_argument if batch_size is negative or no streams provided
+ * @throws std::runtime_error if CUDA operations fail
+ */
 template <typename T>
     requires DctScalar<T>
 void GpuDct<T>::batch_dct_device_multistream(const T *d_images,
