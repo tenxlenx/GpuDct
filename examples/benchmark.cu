@@ -40,16 +40,6 @@ class CudaEvent {
     CudaEvent(CudaEvent &&other) noexcept
         : m_event(std::exchange(other.m_event, nullptr)) {}
 
-    CudaEvent &operator=(CudaEvent &&other) noexcept {
-        if (this != &other) {
-            if (m_event != nullptr) {
-                cudaEventDestroy(m_event);
-            }
-            m_event = std::exchange(other.m_event, nullptr);
-        }
-        return *this;
-    }
-
     [[nodiscard]] cudaEvent_t get() const { return m_event; }
 
   private:
@@ -157,22 +147,9 @@ class StreamList {
         other.m_streams.clear();
     }
 
-    StreamList &operator=(StreamList &&other) noexcept {
-        if (this != &other) {
-            release();
-            m_streams = std::move(other.m_streams);
-            other.m_streams.clear();
-        }
-        return *this;
-    }
-
     [[nodiscard]] cudaStream_t *data() { return m_streams.data(); }
-    [[nodiscard]] const cudaStream_t *data() const { return m_streams.data(); }
     [[nodiscard]] int size() const {
         return static_cast<int>(m_streams.size());
-    }
-    [[nodiscard]] cudaStream_t operator[](int index) const {
-        return m_streams[index];
     }
     [[nodiscard]] cudaStream_t &operator[](int index) {
         return m_streams[index];
