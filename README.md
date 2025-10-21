@@ -109,6 +109,17 @@ cudaFree(d_hashes);
 
 Hashes remain on the device, enabling additional GPU-side comparisons before any host transfer.
 
+### 4. Hashing a real image
+
+Download any public grayscale or RGB square image and feed it through the helper utility:
+
+```bash
+cmake --build build -j$(nproc)
+./build/examples/gpu_dct_hash_image path/to/lena.jpg 256
+```
+
+The tool uses stb_image to decode the asset, converts it to grayscale, downsamples to the requested DCT size (32, 64, 128, or 256), and prints the 64-bit perceptual hash so you can cross-check against other implementations.
+
 ### Feeding data from image libraries (optional)
 
 GpuDct only expects a contiguous buffer of pixel intensities, so you can lift data from whatever host-side library you already use without additional dependencies. For example, with OpenCV:
@@ -168,3 +179,5 @@ The tool reports per-image latency, throughput, and data type comparisons for qu
 ## License
 
 MIT. See `LICENSE` for details.
+
+The repository vendors `stb_image.h` (public-domain / MIT dual licensed) in `third_party/` for sample image decoding.
