@@ -7,6 +7,7 @@ GpuDct is a CUDA C++20 library that computes 64-bit perceptual hashes from squar
 - Stream-ordered temporary allocations via CUDA memory pools (no hot-path malloc)
 - In-kernel 8x8 hashing and median selection yielding a 64-bit binary fingerprint
 - Batch and multi-stream helpers for high-throughput pipelines
+- Benchmarks instrumented with CUDA events for precise GPU time attribution
 - CMake package configured for CUDA + C++20, friendly with FetchContent and install exports
 
 ## Requirements
@@ -14,6 +15,7 @@ GpuDct is a CUDA C++20 library that computes 64-bit perceptual hashes from squar
 - CUDA Toolkit 12.x (tested) with `nvcc`
 - CMake 3.18 or newer
 - Host compiler with full C++20 support (GCC 11+, Clang 14+, MSVC 19.3+)
+- No bundled image-processing dependencies. Provide your own contiguous buffers from any loader you prefer (stb_image, OpenCV, etc.).
 
 ## Quick Start
 
@@ -107,6 +109,26 @@ cudaFree(d_hashes);
 
 Hashes remain on the device, enabling additional GPU-side comparisons before any host transfer.
 
+### Feeding data from image libraries (optional)
+
+GpuDct only expects a contiguous buffer of pixel intensities, so you can lift data from whatever host-side library you already use without additional dependencies. For example, with OpenCV:
+
+```cpp
+cv::Mat gray = cv::imread(path, cv::IMREAD_GRAYSCALE);
+if (!gray.data || gray.rows != N || gray.cols != N) {
+    throw std::runtime_error("unexpected image dimensions");
+}
+
+std::vector<float> image(gray.rows * gray.cols);
+std::transform(gray.begin<uint8_t>(), gray.end<uint8_t>(), image.begin(),
+               [](uint8_t v) { return static_cast<float>(v); });
+
+gpu_dct::GpuDct<float> dct(N);
+const uint64_t hash = dct.dct_host(image.data());
+```
+
+Any loader that produces a contiguous block (stb_image, libpng, custom CUDA pipelines) can be wired up the same way.
+
 ## Using GpuDct in another CMake project
 
 ```cmake
@@ -128,7 +150,7 @@ Override `CMAKE_CUDA_ARCHITECTURES` in the parent project to match deployment ha
 
 ## Benchmarking
 
-`examples/gpu_dct_benchmark` exercises single images, batched runs, and multi-stream scenarios. CLI usage:
+`examples/gpu_dct_benchmark` exercises single images, batched runs, and multi-stream scenarios with CUDA event profiling on every test. CLI usage:
 
 ```
 ./gpu_dct_benchmark                # 32x32, default iterations

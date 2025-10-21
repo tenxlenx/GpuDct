@@ -38,6 +38,7 @@ Testing/
 .DS_Store
 *.swp
 *.swo
+.github/
 
 # Profiling and logs
 *.nvvp

@@ -1,8 +1,9 @@
 #include <chrono>
 #include <cstdint>
-#include <gpu_dct.cuh>
 #include <iostream>
 #include <vector>
+
+#include <gpu_dct.cuh>
 
 using namespace gpu_dct;
 

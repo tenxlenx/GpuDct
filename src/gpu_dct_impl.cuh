@@ -1,10 +1,10 @@
 #pragma once
 
-#include "../include/gpu_dct.cuh"
 #include <cmath>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
+#include <gpu_dct.cuh>
 
 namespace gpu_dct {
 

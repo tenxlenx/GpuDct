@@ -1,4 +1,5 @@
-#include "../include/gpu_dct.cuh"
+#include <gpu_dct.cuh>
+
 #include "gpu_dct_impl.cuh"
 
 #include <cuda_runtime.h>
